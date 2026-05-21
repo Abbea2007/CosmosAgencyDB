@@ -418,28 +418,61 @@ BEGIN
 
     DECLARE @datos XML = EVENTDATA();
 
+    -- Nota que ya NO llamamos a id_auditoria en el INSERT ni en el VALUES
     INSERT INTO dbo.AuditoriaCambio
-        (entidad, id_registro, operacion, fecha_hora, usuario, detalle_json)
+        (entidad, operacion, fecha, id_usuario, detalle)
     VALUES (
-        -- Objeto afectado
+        -- 1. entidad
         ISNULL(@datos.value('(/EVENT_INSTANCE/ObjectName)[1]',  'NVARCHAR(60)'),  'ESQUEMA'),
-        -- Tipo de objeto
-        ISNULL(@datos.value('(/EVENT_INSTANCE/ObjectType)[1]',  'NVARCHAR(40)'),  'N/A'),
-        -- Tipo de operación (primeras 10 letras del evento)
+        
+        -- 2. operacion (Cortado a 10 caracteres para que quepa en tu columna)
         LEFT(@datos.value('(/EVENT_INSTANCE/EventType)[1]',     'NVARCHAR(100)'), 10),
-        -- Timestamp
+        
+        -- 3. fecha
         GETDATE(),
-        -- Usuario que ejecutó el cambio
-        @datos.value('(/EVENT_INSTANCE/LoginName)[1]',          'NVARCHAR(40)'),
-        -- Script ejecutado (primeros 1000 chars)
+        
+        -- 4. id_usuario
+        ISNULL(@datos.value('(/EVENT_INSTANCE/LoginName)[1]',   'NVARCHAR(40)'), 'UNKNOWN'),
+        
+        -- 5. detalle
         LEFT(@datos.value('(/EVENT_INSTANCE/TSQLCommand/CommandText)[1]', 'NVARCHAR(MAX)'), 1000)
     );
 END;
 GO
 
-PRINT '==> Trigger de auditoría DDL creado.';
+SELECT name AS Columna_Identity
+FROM sys.columns
+WHERE object_id = OBJECT_ID('dbo.AuditoriaCambio')
+  AND is_identity = 1;
+
+  EXEC sp_help 'dbo.AuditoriaCambio';
+  DISABLE TRIGGER trg_auditoria_ddl_cosmos ON DATABASE;
+  -- 1. Crear una tabla idéntica pero con la propiedad IDENTITY(1,1)
+CREATE TABLE dbo.AuditoriaCambio_Nueva (
+    id_auditoria INT IDENTITY(1,1) NOT NULL,
+    entidad NVARCHAR(60) NULL,
+    operacion NVARCHAR(10) NULL,
+    fecha DATETIME NULL,
+    id_usuario NVARCHAR(40) NULL,
+    detalle NVARCHAR(1000) NULL,
+    CONSTRAINT PK_AuditoriaCambio_Nueva PRIMARY KEY (id_auditoria)
+);
+GO
+-- 2. SI YA TIENES DATOS: Migrar los datos de la vieja a la nueva
+-- (SQL Server le asignará un número automático a los registros viejos)
+INSERT INTO dbo.AuditoriaCambio_Nueva (entidad, operacion, fecha, id_usuario, detalle)
+SELECT entidad, operacion, fecha, id_usuario, detalle 
+FROM dbo.AuditoriaCambio;
 GO
 
+DROP TABLE dbo.AuditoriaCambio;
+GO
+
+EXEC sp_rename 'dbo.AuditoriaCambio_Nueva', 'AuditoriaCambio';
+GO
+
+DROP TRIGGER trg_auditoria_ddl_cosmos ON DATABASE;
+GO
 
 -- ============================================================
 -- SECCIÓN 7: TRIGGERS DML DE AUDITORÍA EN TABLAS SENSIBLES
@@ -465,7 +498,7 @@ BEGIN
         SET @op = 'D';
 
     -- Audita cada fila afectada
-    INSERT INTO dbo.AuditoriaCambio (entidad, id_registro, operacion, fecha_hora, usuario, detalle_json)
+    INSERT INTO dbo.(entidad, operacion, fecha, id_usuario, detalle)
     SELECT
         'Expediente',
         CAST(ISNULL(i.id_expediente, d.id_expediente) AS VARCHAR(40)),
@@ -478,6 +511,9 @@ BEGIN
     FROM inserted i
     FULL OUTER JOIN deleted d ON i.id_expediente = d.id_expediente;
 END;
+GO
+
+DROP TRIGGER trg_audit_expediente
 GO
 
 -- ----------------------------------------------------------
@@ -498,7 +534,7 @@ BEGIN
     ELSE
         SET @op = 'D';
 
-    INSERT INTO dbo.AuditoriaCambio (entidad, id_registro, operacion, fecha_hora, usuario, detalle_json)
+    INSERT INTO dbo.AuditoriaCambio (id_auditoria, entidad, operacion, fecha, id_usuario, detalle)
     SELECT
         'Declaracion',
         CAST(ISNULL(i.id_declaracion, d.id_declaracion) AS VARCHAR(40)),
@@ -506,8 +542,7 @@ BEGIN
         GETDATE(),
         SYSTEM_USER,
         '{"numero":"'       + ISNULL(i.numero, ISNULL(d.numero,'')) +
-        '","valor_aduana":"'+ CAST(ISNULL(i.valor_aduana, d.valor_aduana) AS VARCHAR(20)) +
-        '","tipo":"'        + ISNULL(i.tipo, ISNULL(d.tipo,'')) + '"}'
+        '","valor_aduana":"'+ CAST(ISNULL(i.valor_aduana, d.valor_aduana) AS VARCHAR(20))'"}'
     FROM inserted i
     FULL OUTER JOIN deleted d ON i.id_declaracion = d.id_declaracion;
 END;
@@ -531,14 +566,14 @@ BEGIN
     ELSE
         SET @op = 'D';
 
-    INSERT INTO dbo.AuditoriaCambio (entidad, id_registro, operacion, fecha_hora, usuario, detalle_json)
+    INSERT INTO dbo.AuditoriaCambio (id_auditoria, entidad, operacion, fecha, id_usuario, detalle)
     SELECT
         'Factura',
         CAST(ISNULL(i.id_factura, d.id_factura) AS VARCHAR(40)),
         @op,
         GETDATE(),
         SYSTEM_USER,
-        '{"numero":"'  + ISNULL(i.numero, ISNULL(d.numero,'')) +
+        '{"numero":"'  + ISNULL(i.numero_factura, ISNULL(d.numero_factura,'')) +
         '","estado_nuevo":"' + ISNULL(i.estado,'') +
         '","estado_ant":"'   + ISNULL(d.estado,'') +
         '","total":"'  + CAST(ISNULL(i.total, d.total) AS VARCHAR(20)) + '"}'
@@ -565,7 +600,7 @@ BEGIN
     ELSE
         SET @op = 'D';
 
-    INSERT INTO dbo.AuditoriaCambio (entidad, id_registro, operacion, fecha_hora, usuario, detalle_json)
+    INSERT INTO dbo.AuditoriaCambio (id_auditoria, entidad, operacion, fecha, id_usuario, detalle)
     SELECT
         'LiquidacionTributo',
         CAST(ISNULL(i.id_liquidacion, d.id_liquidacion) AS VARCHAR(40)),
@@ -593,6 +628,8 @@ DENY DELETE ON dbo.Factura           TO rol_facturacion;
 DENY DELETE ON dbo.Pago              TO rol_facturacion;
 DENY DELETE ON dbo.LiquidacionTributo TO rol_facturacion;
 DENY DELETE ON dbo.DetalleFactura    TO rol_facturacion;
+
+EXEC sp_helptext 'trg_auditoria_ddl_cosmos';
 
 -- Política 2: Denegar DELETE en tabla de auditoría para todos
 DENY DELETE ON dbo.AuditoriaCambio TO rol_operaciones;
@@ -622,7 +659,7 @@ GO
 
 PRINT '==> Políticas de seguridad aplicadas.';
 GO
-
+SELECT * FROM AuditoriaCambio
 
 -- ============================================================
 -- SECCIÓN 9: VERIFICACIÓN — consultas para confirmar que todo
